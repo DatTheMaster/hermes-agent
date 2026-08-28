@@ -377,3 +377,110 @@ test('managed update drain rechecks Windows PID/create-time ownership before exa
     false
   )
 })
+
+test('fresh Windows spawn adopts the served session token before returning (upstream #94119)', async () => {
+  // The POSIX path adopts the serve's ACTUAL session token via
+  // adoptOwnedServedToken; the Windows path previously returned the uploaded
+  // token unverified, so a token that never landed in the remote serve left
+  // every API call 401'ing with "no_cookie" (the Windows SSH-remote
+  // session-load failure). This test pins that a fresh spawn now calls
+  // adoptServedToken and returns ITS result.
+  let adopted = false
+  let returnedToken = ''
+  const spawnNonce = 'aabbccddeeff0011'
+  const uploadedToken = 'uploaded-token-abc'
+  const servedToken = 'served-token-xyz'
+  const lock = {
+    schemaVersion: 2,
+    protocolVersion: 1,
+    ownershipId,
+    spawnNonce,
+    pid: 4242,
+    creationTimeNs: '1784219690452757504',
+    port: 0,
+    profile: 'default',
+    tokenFingerprint: crypto.createHash('sha256').update(uploadedToken).digest('hex').slice(0, 32),
+    hermesPath: 'C:\\Hermes\\hermes.exe',
+    hermesHome: 'C:\\Hermes'
+  }
+
+  const ssh = sshWith(async command => {
+    const script = Buffer.from(command.split(' ').at(-1) || '', 'base64').toString('utf16le')
+
+    // The spawn command runs hermes_cli.windows_ssh_runtime spawn AND embeds
+    // the update-marker check — must be matched BEFORE the marker branch so
+    // 'CLEAR' never leaks into its JSON.parse.
+    if (script.includes('windows_ssh_runtime') && script.includes('spawn')) {
+      return JSON.stringify({
+        pid: 4242,
+        creationTimeNs: '1784219690452757504',
+        error: null
+      })
+    }
+    if (script.includes('.hermes-update-in-progress')) {
+      return 'CLEAR'
+    }
+    if (script.includes('Get-Command hermes.exe')) {
+      return JSON.stringify({
+        os: 'Windows',
+        arch: 'AMD64',
+        hermesHome: 'C:\\Hermes',
+        hermesPath: 'C:\\Hermes\\hermes.exe',
+        python: 'C:\\Hermes\\python.exe'
+      })
+    }
+    if (script.includes("'inspect'") || script.includes('"inspect"')) {
+      return JSON.stringify({ supported: true, path: 'C:\\Hermes\\hermes.exe', version: '0.20.6' })
+    }
+    if (script.includes("'read-lock'")) {
+      return JSON.stringify(null)
+    }
+    if (script.includes('"upload-token"')) {
+      return JSON.stringify({ ok: true })
+    }
+    if (script.includes("'write-lock'")) {
+      return JSON.stringify({ ok: true })
+    }
+    if (script.includes("'wait-ready'")) {
+      return JSON.stringify({ port: 43021, ready: true })
+    }
+    if (script.includes("'process-state'")) {
+      return JSON.stringify({ alive: true, owned: true, indeterminate: false })
+    }
+    if (script.includes("'read-log'")) {
+      return JSON.stringify({ content: 'HERMES_BACKEND_READY port=43021\n  Hermes backend listening on 127.0.0.1:43021' })
+    }
+    if (script.includes("'remove-token'")) {
+      return JSON.stringify({ ok: true })
+    }
+    return JSON.stringify({ ok: true })
+  })
+
+  const result = await connectWindowsRemote({
+    ssh,
+    ownershipId,
+    pickLocalPort: async () => 50000,
+    forward: async () => {},
+    cancelForward: async () => {},
+    waitForHermes: async () => {},
+    probeReuseProof: async () => 'authenticated-stale',
+    adoptServedToken: async (baseUrl, token, options) => {
+      adopted = true
+      // The exact token is lifecycle-internal (uploaded then fingerprinted);
+      // the contract we pin is that adoption is invoked with a non-empty
+      // token and a childAlive thunk, and its result becomes the return value.
+      assert.ok(typeof token === 'string' && token.length > 0, 'adoptServedToken must receive a non-empty token')
+      assert.equal(typeof options.childAlive, 'function')
+      const alive = await options.childAlive()
+      assert.equal(alive, true)
+      return servedToken
+    }
+  })
+
+  assert.equal(adopted, true, 'adoptServedToken must be called on a fresh Windows spawn')
+  assert.equal(result.token, servedToken, 'the returned token must be the ADOPTED served token, not the uploaded one')
+  returnedToken = result.token
+  assert.notEqual(returnedToken, uploadedToken)
+  assert.equal(result.baseUrl, 'http://127.0.0.1:50000')
+  assert.equal(result.pid, 4242)
+})

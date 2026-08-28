@@ -558,6 +558,7 @@ async function connectWindowsRemote(deps) {
     cancelForward,
     waitForHermes,
     probeReuseProof,
+    adoptServedToken,
     rememberLog = () => {},
     readyTimeoutMs = 45_000
   } = deps
@@ -722,11 +723,32 @@ async function connectWindowsRemote(deps) {
     const baseUrl = `http://127.0.0.1:${localPort}`
     await waitForHermes(baseUrl, token)
     assertBootstrapNotSuperseded(signal)
+
+    // Adopt the serve's ACTUAL session token instead of trusting the
+    // uploaded one. `waitForHermes` only probes the unauthenticated
+    // /api/health endpoint, so a token that never landed in the remote
+    // serve (upload race, boot ordering, a serve that started with a
+    // different token) would otherwise pass readiness and leave every
+    // later API call 401'ing with "no_cookie" — the Windows SSH-remote
+    // session-load failure (upstream #94119). Mirror the POSIX path,
+    // which adopts via adoptOwnedServedToken before returning.
+    const adopted = typeof adoptServedToken === 'function'
+      ? await adoptServedToken(baseUrl, token, {
+          childAlive: async () => {
+            const state = await processState(ssh, runtime, owned).catch(() => null)
+            return state?.alive !== false
+          },
+          ownershipId,
+          spawnNonce,
+          label: 'remote dashboard'
+        })
+      : token
+
     await helper(ssh, runtime, 'write-lock', [ownershipId], JSON.stringify({ ...owned, port: remotePort }))
 
     return {
       baseUrl,
-      token,
+      token: adopted,
       remotePort,
       localPort,
       pid: spawned.pid,
